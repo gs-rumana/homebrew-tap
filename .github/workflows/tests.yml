@@ -1,0 +1,55 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  casks:
+    name: Casks
+    runs-on: macos-latest
+    env:
+      TAP: ${{ github.repository_owner }}/tap
+    steps:
+      - name: Set up Homebrew
+        id: brew
+        uses: Homebrew/actions/setup-homebrew@ceec4e8419bb3c97ce96e9dda7738499ed5f869d # 2026.11.14.1
+      # Homebrew only loads taps you trust; this one is checked out from the commit under test.
+      - run: brew trust "$TAP"
+      - run: brew style "$TAP"
+      - run: brew audit --strict --online --tap "$TAP"
+      # A clean runner is the one place a full install, launch and zap can't touch anyone's data.
+      - name: Install, launch and uninstall
+        env:
+          TAP_PATH: ${{ steps.brew.outputs.repository-path }}
+        run: |
+          shopt -s nullglob
+          for file in "$TAP_PATH"/Casks/*.rb; do
+            cask="$TAP/$(basename "$file" .rb)"
+            brew install --cask "$cask"
+            brew info --cask --json=v2 "$cask" | jq -r '.casks[0].artifacts[] | select(.app) | .target' |
+              while read -r app; do
+                # Gatekeeper blocks a quarantined app that isn't notarized on its first launch.
+                if xattr -p com.apple.quarantine "$app" > /dev/null 2>&1 && ! spctl --assess --type execute "$app"; then
+                  echo "::error::$app is quarantined and Gatekeeper rejects it."
+                  exit 1
+                fi
+                open "$app"
+                sleep 10
+                pgrep -f "$app/Contents/MacOS/" > /dev/null || { echo "::error::$app didn't start."; exit 1; }
+              done
+            brew uninstall --cask --zap "$cask"
+          done
